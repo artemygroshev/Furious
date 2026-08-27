@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=RockyRay
+Comment=GUI VPN client with Xray-core and Hysteria support
+Exec=rockyray
+Icon=rockyray
+Terminal=false
+Categories=Network;Utility;
+StartupNotify=true

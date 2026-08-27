@@ -177,6 +177,12 @@ flatpak/
 # Linux rpmbuild dir
 rpmbuild/
 
+# RockyRay local package builds
+RockyRay-Deploy/
+RockyRay-*-stage/
+.rpm-build/
+.package-smoke*/
+
 # zip files
 *.zip
 # msi files
