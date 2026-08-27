@@ -296,7 +296,10 @@ class ConnectAction(AppQAction):
 
                         self.coreManager.stopAll()
                         self.doDisconnectWithTrayMessage(
-                            f'{config.coreName()}: ' + _('Unknown error')
+                            f"{config.coreName()}: "
+                            + _('Failed to set system proxy: {reason}').format(
+                                reason=str(ex)
+                            )
                         )
                     else:
                         self.doConnected()
@@ -316,8 +319,14 @@ class ConnectAction(AppQAction):
                     logger.error('failed to start core manager')
 
                     self.coreManager.stopAll()
+
+                    detail = str(self.coreManager.lastStartError).strip()
+
+                    if not detail:
+                        detail = _('Unknown error')
+
                     self.doDisconnectWithTrayMessage(
-                        f'{config.coreName()}: ' + _('Unknown error')
+                        f'{config.coreName()}: {detail}'
                     )
             else:
                 while not self.actionQueue.empty():

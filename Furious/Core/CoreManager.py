@@ -396,6 +396,7 @@ class CoreManager(Mixins.CleanupOnExit):
 
         self.uniqueCleanup = False
         self.processesPool = list()
+        self.lastStartError = ''
 
     @functools.singledispatchmethod
     def _startCore(
@@ -637,9 +638,14 @@ class CoreManager(Mixins.CleanupOnExit):
         else:
             configcopy = config
 
+        self.lastStartError = ''
+
         def abortStart(message: str = ''):
             if message:
                 logger.error(message)
+                self.lastStartError = message
+            else:
+                self.lastStartError = 'failed to start core'
 
             self.stopAll()
 
