@@ -42,7 +42,12 @@ __all__ = ['cleanRoutingRule', 'configureLinuxTunAnyDeskBypass', 'CoreManager']
 
 logger = logging.getLogger(__name__)
 
-ROCKYRAY_ANYDESK_DOMAIN = 'domain:net.anydesk.com'
+ROCKYRAY_ANYDESK_DOMAINS = (
+    'domain:net.anydesk.com',
+    'domain:anydesk.com',
+    'domain:my.anydesk.com',
+    'domain:crl.anydesk.com',
+)
 ROCKYRAY_ANYDESK_OUTBOUND_TAG = 'rockyray-anydesk-direct'
 ROCKYRAY_ANYDESK_RULE_TAG = 'rockyray-anydesk-direct'
 ROCKYRAY_DIRECT_SOURCE_IP = '169.254.252.82'
@@ -393,9 +398,11 @@ def configureLinuxTunAnyDeskBypass(
     elif not isinstance(rules, list):
         return False
 
-    # Keep this outbound dedicated to AnyDesk. Binding a local source address
-    # does not require CAP_NET_ADMIN; the system policy rule installed by
-    # rockyray-split-routing sends that source through the physical gateway.
+    # The helper's nftables rules provide the primary bypass for AnyDesk's
+    # opaque IP traffic. Keep this Xray fallback for destinations that expose
+    # a domain name. Binding a local source address does not require
+    # CAP_NET_ADMIN; the policy rule sends that source through the physical
+    # gateway.
     anydeskOutbound = {
         'tag': ROCKYRAY_ANYDESK_OUTBOUND_TAG,
         'protocol': 'freedom',
@@ -442,7 +449,7 @@ def configureLinuxTunAnyDeskBypass(
         {
             'type': 'field',
             'ruleTag': ROCKYRAY_ANYDESK_RULE_TAG,
-            'domain': [ROCKYRAY_ANYDESK_DOMAIN],
+            'domain': list(ROCKYRAY_ANYDESK_DOMAINS),
             'outboundTag': ROCKYRAY_ANYDESK_OUTBOUND_TAG,
         },
     )

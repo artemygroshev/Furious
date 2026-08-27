@@ -17,12 +17,24 @@ RP_FILTER_STATE_FILE="/run/rockyray-rp-filter"
 
 STATE_DIR="/var/lib/rockyray"
 RU_CACHE="${STATE_DIR}/ru-ipv4.txt"
-NFT_FILE="/run/rockyray-ru-ipv4.nft"
+ANYDESK_CACHE="${STATE_DIR}/anydesk-ipv4.txt"
+NFT_FILE="/run/rockyray-routing.nft"
 MAX_CACHE_AGE=86400
+ANYDESK_SERVICE_CGROUP="system.slice/anydesk.service"
 
 URLS=(
     "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/ru.txt"
     "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/text/ru.txt"
+)
+
+# AnyDesk publishes its relay bootstrap servers under *.net.anydesk.com. The
+# client also contacts the account and certificate endpoints below. Resolving
+# these names at every TUN start keeps the direct-IP fallback current.
+ANYDESK_DOMAINS=(
+    "boot.net.anydesk.com"
+    "anydesk.com"
+    "my.anydesk.com"
+    "crl.anydesk.com"
 )
 
 log() {
@@ -234,56 +246,199 @@ PY
     log "кеш российских сетей обновлён"
 }
 
+refresh_anydesk_cache() {
+    mkdir -p "$STATE_DIR"
+
+    local temporary
+    temporary="$(mktemp "${STATE_DIR}/anydesk-raw.XXXXXX")"
+
+    if ! python3 - "$temporary" "${ANYDESK_DOMAINS[@]}" <<'PY'
+from __future__ import annotations
+
+import ipaddress
+import pathlib
+import socket
+import sys
+
+destination = pathlib.Path(sys.argv[1])
+domains = sys.argv[2:]
+addresses: set[ipaddress.IPv4Address] = set()
+failures: list[str] = []
+
+for domain in domains:
+    try:
+        records = socket.getaddrinfo(
+            domain,
+            None,
+            socket.AF_INET,
+            socket.SOCK_DGRAM,
+        )
+    except OSError as exc:
+        failures.append(f"{domain}: {exc}")
+        continue
+
+    for _, _, _, _, socket_address in records:
+        address = ipaddress.ip_address(socket_address[0])
+
+        if address.is_global:
+            addresses.add(address)
+
+if not addresses:
+    joined = '; '.join(failures) if failures else 'no IPv4 records returned'
+    raise SystemExit(f'не удалось разрешить адреса AnyDesk: {joined}')
+
+destination.write_text(
+    '\n'.join(str(address) for address in sorted(addresses)) + '\n',
+    encoding='utf-8',
+)
+
+print(
+    f"AnyDesk IPv4: {len(addresses)} "
+    f"(домены: {', '.join(domains)})"
+)
+PY
+    then
+        rm -f "$temporary"
+
+        if [[ -s "$ANYDESK_CACHE" ]]; then
+            log "обновление адресов AnyDesk не удалось; используется прежний кеш"
+            return 0
+        fi
+
+        log "адреса AnyDesk недоступны; IP-обход временно не добавлен"
+        return 1
+    fi
+
+    install -m 0644 "$temporary" "$ANYDESK_CACHE"
+    rm -f "$temporary"
+
+    log "адреса AnyDesk обновлены"
+}
+
+anydesk_service_cgroup() {
+    local absolute_path="/sys/fs/cgroup/${ANYDESK_SERVICE_CGROUP}"
+
+    if [[ -d "$absolute_path" ]]; then
+        printf '%s\n' "$ANYDESK_SERVICE_CGROUP"
+    fi
+}
+
 generate_nft_file() {
-    python3 - "$RU_CACHE" "$NFT_FILE" <<'PY'
+    local anydesk_cgroup="${1:-}"
+
+    python3 - "$RU_CACHE" "$ANYDESK_CACHE" "$NFT_FILE" "$anydesk_cgroup" <<'PY'
 from __future__ import annotations
 
 import ipaddress
 import pathlib
 import sys
 
-source = pathlib.Path(sys.argv[1])
-destination = pathlib.Path(sys.argv[2])
+ru_source = pathlib.Path(sys.argv[1])
+anydesk_source = pathlib.Path(sys.argv[2])
+destination = pathlib.Path(sys.argv[3])
+anydesk_cgroup = sys.argv[4]
 
-networks: list[str] = []
+def read_networks(source: pathlib.Path, *, required: bool) -> list[str]:
+    networks: list[ipaddress.IPv4Network] = []
 
-for raw_line in source.read_text(encoding="utf-8").splitlines():
-    line = raw_line.strip()
+    if not source.exists():
+        if required:
+            raise SystemExit(f"Не найден кеш сетей: {source}")
+        return []
 
-    if not line:
-        continue
+    for raw_line in source.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
 
-    network = ipaddress.ip_network(line, strict=False)
+        if not line:
+            continue
 
-    if network.version == 4:
-        networks.append(str(network))
+        try:
+            network = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            continue
 
-if not networks:
-    raise SystemExit("Список российских IPv4-сетей пуст")
+        if network.version == 4:
+            networks.append(network)
+
+    collapsed = list(ipaddress.collapse_addresses(networks))
+
+    if required and not collapsed:
+        raise SystemExit("Список российских IPv4-сетей пуст")
+
+    return [str(network) for network in collapsed]
+
+
+def write_set(stream, name: str, networks: list[str]) -> None:
+    stream.write(f"    set {name} {{\n")
+    stream.write("        type ipv4_addr\n")
+    stream.write("        flags interval\n")
+
+    if networks:
+        stream.write("        elements = {\n")
+
+        for index, network in enumerate(networks):
+            comma = "," if index < len(networks) - 1 else ""
+            stream.write(f"            {network}{comma}\n")
+
+        stream.write("        }\n")
+
+    stream.write("    }\n")
+
+
+ru_networks = read_networks(ru_source, required=True)
+anydesk_networks = read_networks(anydesk_source, required=False)
 
 with destination.open("w", encoding="utf-8") as stream:
     stream.write("table inet rockyray {\n")
-    stream.write("    set ru4 {\n")
-    stream.write("        type ipv4_addr\n")
-    stream.write("        flags interval\n")
-    stream.write("        elements = {\n")
-
-    for index, network in enumerate(networks):
-        comma = "," if index < len(networks) - 1 else ""
-        stream.write(f"            {network}{comma}\n")
-
-    stream.write("        }\n")
-    stream.write("    }\n")
+    write_set(stream, "anydesk4", anydesk_networks)
+    stream.write("\n")
+    write_set(stream, "ru4", ru_networks)
     stream.write("\n")
     stream.write("    chain output {\n")
     stream.write("        type route hook output priority mangle; policy accept;\n")
+
+    if anydesk_cgroup:
+        cgroup_level = anydesk_cgroup.count("/") + 1
+        stream.write(
+            f'        socket cgroupv2 level {cgroup_level} '
+            f'"{anydesk_cgroup}" counter meta mark set 0x5252 '
+            'comment "rockyray-anydesk-cgroup"\n'
+        )
+
+    stream.write(
+        "        ip daddr @anydesk4 counter "
+        "meta mark set 0x5252 comment \"rockyray-anydesk-dns\"\n"
+    )
     stream.write(
         "        ip daddr @ru4 counter "
-        "meta mark set 0x5252\n"
+        "meta mark set 0x5252 comment \"rockyray-ru\"\n"
     )
     stream.write("    }\n")
     stream.write("}\n")
 PY
+}
+
+load_nft_rules() {
+    local anydesk_cgroup="${1:-}"
+
+    generate_nft_file "$anydesk_cgroup"
+    nft delete table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null || true
+
+    if nft -f "$NFT_FILE"; then
+        return 0
+    fi
+
+    if [[ -z "$anydesk_cgroup" ]]; then
+        return 1
+    fi
+
+    # Some older kernels/nftables builds lack socket cgroupv2 support. The
+    # current resolver-backed AnyDesk set is still a safe direct-route
+    # fallback, so do not make the whole VPN connection fail in that case.
+    log "cgroupv2-сопоставление AnyDesk недоступно; используется IP-обход"
+    generate_nft_file ""
+    nft delete table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null || true
+    nft -f "$NFT_FILE"
 }
 
 up_impl() {
@@ -344,7 +499,10 @@ PY
     fi
 
     refresh_cache
-    generate_nft_file
+    refresh_anydesk_cache || true
+
+    local anydesk_cgroup
+    anydesk_cgroup="$(anydesk_service_cgroup)"
 
     # Создаём отдельную таблицу с физическим подключением.
     while IFS= read -r route_line; do
@@ -396,7 +554,7 @@ PY
         return 1
     fi
 
-    if ! nft -f "$NFT_FILE"; then
+    if ! load_nft_rules "$anydesk_cgroup"; then
         log "не удалось применить nftables"
         down_impl
         return 1
@@ -414,8 +572,8 @@ PY
         return 1
     fi
 
-    if ! nft add rule "$NFT_FAMILY" "$NFT_TABLE" postrouting meta mark "$MARK" oifname "$interface" masquerade comment '"rockyray-ru-snat"'; then
-        log "не удалось добавить SNAT для прямого российского трафика"
+    if ! nft add rule "$NFT_FAMILY" "$NFT_TABLE" postrouting meta mark "$MARK" oifname "$interface" masquerade comment '"rockyray-marked-snat"'; then
+        log "не удалось добавить SNAT для маркированного прямого трафика"
         down_impl
         return 1
     fi
@@ -450,7 +608,11 @@ PY
     ip -4 route flush cache 2>/dev/null || true
     trap - ERR
 
-    log "российские IPv4 направляются через ${gateway}/${interface}"
+    if [[ -n "$anydesk_cgroup" ]]; then
+        log "AnyDesk (${anydesk_cgroup}) и российские IPv4 направляются через ${gateway}/${interface}"
+    else
+        log "AnyDesk по актуальным IP и российские IPv4 направляются через ${gateway}/${interface}"
+    fi
 }
 
 status_impl() {
@@ -475,6 +637,21 @@ status_impl() {
     echo
     echo "=== nftables ==="
     nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null | sed -n '1,80p' || true
+
+    echo
+    echo "=== Обход AnyDesk ==="
+    if [[ -d "/sys/fs/cgroup/${ANYDESK_SERVICE_CGROUP}" ]]; then
+        echo "Cgroup сервиса: ${ANYDESK_SERVICE_CGROUP}"
+    else
+        echo "Cgroup сервиса: не найден (используется IP-обход)"
+    fi
+
+    if [[ -s "$ANYDESK_CACHE" ]]; then
+        stat "$ANYDESK_CACHE"
+        echo "Количество IPv4: $(wc -l < "$ANYDESK_CACHE")"
+    else
+        echo "Кеш адресов AnyDesk отсутствует"
+    fi
 
     echo
     echo "=== Кеш сетей ==="
@@ -503,6 +680,7 @@ case "${1:-}" in
 
     refresh)
         refresh_cache
+        refresh_anydesk_cache || true
         ;;
 
     status)
