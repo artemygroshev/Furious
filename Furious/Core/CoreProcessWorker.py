@@ -31,6 +31,8 @@ import os
 import sys
 import time
 import uuid
+import signal
+import ctypes
 import logging
 import threading
 import multiprocessing
@@ -46,6 +48,39 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+LINUX_PR_SET_PDEATHSIG = 1
+
+
+def runCoreProcessWithParentGuard(
+    expectedParentPID: int,
+    target: Callable,
+    args: Tuple[Any, ...],
+):
+    """Run a core and make the kernel reap it if its parent disappears."""
+
+    if PLATFORM == 'Linux':
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            result = libc.prctl(
+                LINUX_PR_SET_PDEATHSIG,
+                signal.SIGKILL,
+                0,
+                0,
+                0,
+            )
+
+            if result != 0:
+                errorNumber = ctypes.get_errno()
+                raise OSError(errorNumber, os.strerror(errorNumber))
+
+            # The parent may have exited between Process.start() and prctl().
+            if os.getppid() != expectedParentPID:
+                os._exit(1)
+        except Exception as ex:
+            logger.warning(f'failed to install core parent-death guard: {ex}')
+
+    return target(*args)
 
 
 class CoreProcessState(Enum):
@@ -97,10 +132,22 @@ class CoreLaunchSpec:
 
     def toProcessKwargs(self):
         kwargs = dict(self.processKwargs)
+
+        target = self.target
+        args = tuple(self.args)
+
+        if PLATFORM == 'Linux':
+            target = runCoreProcessWithParentGuard
+            args = (
+                os.getpid(),
+                self.target,
+                args,
+            )
+
         kwargs.update(
             {
-                'target': self.target,
-                'args': tuple(self.args),
+                'target': target,
+                'args': args,
             }
         )
 

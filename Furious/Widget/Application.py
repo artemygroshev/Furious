@@ -417,9 +417,7 @@ class Application(ApplicationFactory, SingletonApplication):
                 return ApplicationFactory.ExitCode.ExitSuccess.value
 
             if not SystemTrayIcon.isSystemTrayAvailable():
-                raise SystemTrayUnavailable(
-                    'SystemTrayIcon is not available on this platform'
-                )
+                print('RockyRay: системный трей недоступен; продолжаем в оконном режиме')
 
             self.addEnviron()
             self.addStorage()
@@ -503,7 +501,7 @@ class Application(ApplicationFactory, SingletonApplication):
                 self.themeListenerThread.start()
 
             # Mandatory
-            self.setQuitOnLastWindowClosed(False)
+            self.setQuitOnLastWindowClosed(True)
 
             self.aboutToQuit.connect(Application.cleanup)
 
@@ -516,7 +514,31 @@ class Application(ApplicationFactory, SingletonApplication):
                 SystemProxy.daemonOn_()
 
             self.mainWindow = AppMainWindow()
+            self.mainWindow.show()
             self.systemTray = SystemTrayIcon()
+            # RockyRay: expose ConnectAction in main toolbar
+            if hasattr(self.mainWindow, 'toolbar'):
+                actions = self.mainWindow.toolbar.actions()
+                if actions:
+                    self.mainWindow.toolbar.insertSeparator(actions[0])
+                    self.mainWindow.toolbar.insertAction(
+                        actions[0], self.systemTray.ConnectAction
+                    )
+                else:
+                    self.mainWindow.toolbar.addAction(
+                        self.systemTray.ConnectAction
+                    )
+
+            # RockyRay: expose TUNModeAction in main toolbar
+            from Furious.TrayActions.Settings import TUNModeAction
+            self.tunModeAction = TUNModeAction(
+                checkable=True,
+                checked=AppSettings.isStateON_('VPNMode'),
+            )
+            self.mainWindow.toolbar.insertAction(
+                self.systemTray.ConnectAction,
+                self.tunModeAction,
+            )
 
             if PLATFORM == 'Darwin':
                 if AppSettings.isStateON_('HideDockIcon'):
@@ -542,6 +564,24 @@ class Application(ApplicationFactory, SingletonApplication):
             self.systemTray.show()
             self.systemTray.setCustomToolTip()
             self.systemTray.bootstrap()
+
+            # Optional RockyRay autobench hook
+            try:
+                from RockyRayStartup import install as installRockyRayAutobench
+
+                installRockyRayAutobench(
+                    self,
+                    auto_start=(
+                        __import__('os').environ.get(
+                            'ROCKYRAY_AUTOBENCH'
+                        ) == '1'
+                    ),
+                )
+            except Exception as ex:  # pragma: no cover
+                logger.debug(
+                    f'RockyRay startup hook not installed: {ex}'
+                )
+
 
             return self.exec()
         except SystemTrayUnavailable:

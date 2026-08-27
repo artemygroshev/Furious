@@ -142,6 +142,32 @@ class SubscriptionManager(WebGETManager):
         actionMessage = kwargs.pop('actionMessage', 'update subs')
 
         super().__init__(parent, actionMessage=actionMessage, mustCallOnce=False)
+        self.activeNetworkReplies: list[QNetworkReply] = list()
+
+    def _registerNetworkReply(self, networkReply):
+        if isinstance(networkReply, QNetworkReply):
+            if networkReply not in self.activeNetworkReplies:
+                self.activeNetworkReplies.append(networkReply)
+
+            networkReply.finished.connect(
+                functools.partial(self._unregisterNetworkReply, networkReply)
+            )
+
+    def _unregisterNetworkReply(self, networkReply):
+        try:
+            self.activeNetworkReplies.remove(networkReply)
+        except ValueError:
+            # Any non-exit exceptions
+
+            pass
+
+    def isRunning(self) -> bool:
+        return bool(self.activeNetworkReplies)
+
+    def cancelAll(self):
+        for networkReply in list(self.activeNetworkReplies):
+            if isinstance(networkReply, QNetworkReply):
+                networkReply.abort()
 
     def handleItemDeletionAndInsertion(self, **kwargs):
         successArgs = kwargs.pop('successArgs', list())
@@ -263,8 +289,35 @@ class SubscriptionManager(WebGETManager):
 
                 logger.error(f'parse share link from \'{webURL}\' failed: {ex}')
 
-        if uris is None:
-            failureArgs.append({'error': classname(lastException), **kwargs})
+        # RockyRay: reject malformed or empty subscription responses
+        validPrefixes = (
+            'vmess://',
+            'vless://',
+            'trojan://',
+            'ss://',
+            'ssr://',
+            'hysteria://',
+            'hysteria2://',
+            'socks://',
+            'socks5://',
+        )
+
+        if uris is not None:
+            uris = list(
+                uri.strip()
+                for uri in uris
+                if uri.strip().lower().startswith(validPrefixes)
+            )
+
+        if not uris:
+            errorText = (
+                'No valid share links in subscription response; '
+                'existing servers were preserved'
+            )
+            logger.error(
+                f'update subs ({remark}, {webURL}) rejected: {errorText}'
+            )
+            failureArgs.append({'error': errorText, **kwargs})
         else:
             logger.info(
                 f'update subs ({remark}, {webURL}) success. Got {len(uris)} share link'
@@ -301,7 +354,9 @@ class SubscriptionManager(WebGETManager):
             f'{APPLICATION_NAME}/{APPLICATION_VERSION}'.encode(),
         )
 
-        self.webGET(request, logActionMessage=logActionMessage, **kwargs)
+        networkReply = self.webGET(request, logActionMessage=logActionMessage, **kwargs)
+
+        self._registerNetworkReply(networkReply)
 
     def updateSubsByUnique(self, unique: str, **kwargs):
         depthMap = kwargs.get('depthMap', {'depth': 1})
@@ -731,6 +786,9 @@ class DownloadSpeedTestScheduler(QtCore.QObject):
         self.activePorts = set()
         self.nextMultiPort = self.MultiPortStart
         self.drainScheduled = False
+
+    def isRunning(self) -> bool:
+        return bool(self.queue) or bool(self.activeJobs)
 
     def enqueue(
         self,
@@ -1373,6 +1431,9 @@ class UserServersQTableView(
         self.proxyModel.setSourceModel(self.sourceModel)
         self.setModel(self.proxyModel)
 
+        # RockyRay: single click only selects the server.
+        # Connection remains unchanged until explicit activation.
+
         self.subsManager = SubscriptionManager(parent=self)
 
         self.downloadSpeedScheduler = DownloadSpeedTestScheduler(
@@ -1875,6 +1936,76 @@ class UserServersQTableView(
         )
 
         self.sortByColumn(clickedIndex, order)
+
+    @QtCore.Slot(QtCore.QModelIndex)
+    def handleRockyRaySingleClick(self, proxyIndex):
+        if not proxyIndex.isValid():
+            return
+
+        sourceIndex = self.proxyModel.mapToSource(proxyIndex)
+
+        if not sourceIndex.isValid():
+            return
+
+        row = sourceIndex.row()
+
+        if row < 0 or row >= len(Storage.UserServers()):
+            return
+
+        app = APP()
+
+        if app is None or appIsExiting():
+            return
+
+        oldRow = Storage.UserActivatedItemIndex()
+        connected = app.isSystemTrayConnected()
+
+        # Уже подключены именно к этому серверу
+        if row == oldRow and connected:
+            return
+
+        # Сначала отключаем прежний сервер
+        if connected:
+            app.systemTray.ConnectAction.doDisconnect()
+
+        self.activateItemByIndex(row, True)
+
+        if connected:
+            # Ждём полного отключения и затем подключаем новый сервер
+            QtCore.QTimer.singleShot(
+                100,
+                functools.partial(
+                    self.rockyRayReconnectAfterSwitch,
+                    0,
+                ),
+            )
+        else:
+            # VPN был отключён — сразу подключаем выбранный сервер
+            app.systemTray.ConnectAction.trigger()
+
+    def rockyRayReconnectAfterSwitch(self, attempt=0):
+        app = APP()
+
+        if app is None or appIsExiting():
+            return
+
+        if not app.isSystemTrayConnected():
+            app.systemTray.ConnectAction.trigger()
+            return
+
+        if attempt >= 50:
+            logger.error(
+                'RockyRay: timeout while switching the active server'
+            )
+            return
+
+        QtCore.QTimer.singleShot(
+            100,
+            functools.partial(
+                self.rockyRayReconnectAfterSwitch,
+                attempt + 1,
+            ),
+        )
 
     def activatedIndex(self):
         return self.proxyIndexFromSourceRow(Storage.UserActivatedItemIndex(), 0)
@@ -2405,7 +2536,25 @@ class UserServersQTableView(
             self.flushItem(index, self.Headers.index('Latency'), factory)
             self.flushItem(index, self.Headers.index('Speed'), factory)
 
+    def hasActiveSubscriptionUpdate(self) -> bool:
+        return self.subsManager.isRunning()
+
+    def hasActiveDownloadSpeedTest(self) -> bool:
+        return (
+            self.downloadSpeedScheduler.isRunning()
+            or self.downloadSpeedMultiScheduler.isRunning()
+        )
+
+    def hasActiveSubscriptionMaintenanceJobs(self) -> bool:
+        return self.hasActiveSubscriptionUpdate() or self.hasActiveDownloadSpeedTest()
+
+    def cancelActiveSubscriptionMaintenanceJobs(self):
+        self.subsManager.cancelAll()
+        self.downloadSpeedScheduler.cancelAll()
+        self.downloadSpeedMultiScheduler.cancelAll()
+
     def cleanup(self):
+        self.subsManager.cancelAll()
         self.downloadSpeedScheduler.cancelAll()
         self.downloadSpeedMultiScheduler.cancelAll()
 

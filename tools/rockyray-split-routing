@@ -1,0 +1,516 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+NFT_FAMILY="inet"
+NFT_TABLE="rockyray"
+ROUTE_TABLE="5252"
+MARK="0x5252"
+RULE_PRIORITY="100"
+SOURCE_RULE_PRIORITY="101"
+SOURCE_RULE_PROTOCOL="242"
+DIRECT_SOURCE_IP="169.254.252.82"
+DIRECT_SOURCE_CIDR="${DIRECT_SOURCE_IP}/32"
+DIRECT_STATE_FILE="/run/rockyray-direct-source"
+RP_FILTER_STATE_FILE="/run/rockyray-rp-filter"
+
+STATE_DIR="/var/lib/rockyray"
+RU_CACHE="${STATE_DIR}/ru-ipv4.txt"
+NFT_FILE="/run/rockyray-ru-ipv4.nft"
+MAX_CACHE_AGE=86400
+
+URLS=(
+    "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/ru.txt"
+    "https://cdn.jsdelivr.net/gh/Loyalsoldier/geoip@release/text/ru.txt"
+)
+
+log() {
+    printf 'RockyRay routing: %s\n' "$*"
+}
+
+restore_rp_filter() {
+    [[ -e "$RP_FILTER_STATE_FILE" ]] || return 0
+
+    local interface value proc_file
+
+    if ! read -r interface value < "$RP_FILTER_STATE_FILE" ||
+       [[ ! "$interface" =~ ^[A-Za-z0-9_.:-]+$ ]] ||
+       [[ ! "$value" =~ ^[012]$ ]]
+    then
+        log "некорректное состояние rp_filter; файл удалён"
+        rm -f "$RP_FILTER_STATE_FILE"
+        return 0
+    fi
+
+    proc_file="/proc/sys/net/ipv4/conf/${interface}/rp_filter"
+
+    if [[ ! -e "$proc_file" ]]; then
+        log "интерфейс ${interface} исчез; состояние rp_filter удалено"
+        rm -f "$RP_FILTER_STATE_FILE"
+        return 0
+    fi
+
+    if printf '%s\n' "$value" > "$proc_file"; then
+        rm -f "$RP_FILTER_STATE_FILE"
+        log "rp_filter для ${interface} восстановлен: ${value}"
+    else
+        log "не удалось восстановить rp_filter для ${interface}"
+        return 1
+    fi
+}
+
+enable_loose_rp_filter() {
+    local interface="$1"
+    local proc_file value
+
+    proc_file="/proc/sys/net/ipv4/conf/${interface}/rp_filter"
+
+    if [[ ! -r "$proc_file" || ! -w "$proc_file" ]]; then
+        log "rp_filter для ${interface} недоступен"
+        return 1
+    fi
+
+    value="$(<"$proc_file")"
+
+    if [[ ! "$value" =~ ^[012]$ ]]; then
+        log "некорректное значение rp_filter для ${interface}: ${value}"
+        return 1
+    fi
+
+    if ! install -m 0600 /dev/null "$RP_FILTER_STATE_FILE"; then
+        log "не удалось сохранить состояние rp_filter"
+        return 1
+    fi
+
+    printf '%s %s\n' "$interface" "$value" > "$RP_FILTER_STATE_FILE"
+
+    # Strict reverse-path filtering checks the main table and drops replies
+    # that arrived through the physical interface while their destination was
+    # selected by policy routing. Loose mode is required for this topology.
+    if ! printf '2\n' > "$proc_file"; then
+        log "не удалось включить loose rp_filter для ${interface}"
+        restore_rp_filter || true
+        return 1
+    fi
+
+    log "rp_filter для ${interface}: ${value} -> 2"
+}
+
+down_impl() {
+    nft delete table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null || true
+
+    while ip -4 rule del \
+        priority "$SOURCE_RULE_PRIORITY" \
+        from "$DIRECT_SOURCE_CIDR" \
+        table "$ROUTE_TABLE" \
+        protocol "$SOURCE_RULE_PROTOCOL" 2>/dev/null
+    do
+        :
+    done
+
+    if [[ -e "$DIRECT_STATE_FILE" ]]; then
+        if ip -4 addr del "$DIRECT_SOURCE_CIDR" dev lo 2>/dev/null ||
+           ! ip -o -4 addr show dev lo |
+               grep -F " ${DIRECT_SOURCE_CIDR} " >/dev/null
+        then
+            rm -f "$DIRECT_STATE_FILE"
+        else
+            log "не удалось удалить адрес direct-outbound; marker сохранён"
+        fi
+    fi
+
+    while ip -4 rule del \
+        fwmark "${MARK}/0xffffffff" \
+        table "$ROUTE_TABLE" 2>/dev/null
+    do
+        :
+    done
+
+    ip -4 route flush table "$ROUTE_TABLE" 2>/dev/null || true
+    ip -4 route flush cache 2>/dev/null || true
+    restore_rp_filter || true
+}
+
+refresh_cache() {
+    mkdir -p "$STATE_DIR"
+
+    local now mtime age
+    now="$(date +%s)"
+    mtime="$(stat -c '%Y' "$RU_CACHE" 2>/dev/null || echo 0)"
+    age=$((now - mtime))
+
+    if [[ -s "$RU_CACHE" && "$age" -lt "$MAX_CACHE_AGE" ]]; then
+        log "используется актуальный кеш российских сетей"
+        return 0
+    fi
+
+    local downloaded=""
+    local raw
+    raw="$(mktemp "${STATE_DIR}/ru-raw.XXXXXX")"
+
+    for url in "${URLS[@]}"; do
+        log "загрузка ${url}"
+
+        if curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 3 \
+            --retry-delay 2 \
+            --connect-timeout 15 \
+            --max-time 180 \
+            "$url" \
+            --output "$raw"
+        then
+            downloaded="yes"
+            break
+        fi
+    done
+
+    if [[ -z "$downloaded" ]]; then
+        rm -f "$raw"
+
+        if [[ -s "$RU_CACHE" ]]; then
+            log "обновление не удалось; используется прежний кеш"
+            return 0
+        fi
+
+        log "не удалось загрузить российские диапазоны"
+        return 1
+    fi
+
+    local compact
+    compact="${raw}.compact"
+
+    python3 - "$raw" "$compact" <<'PY'
+from __future__ import annotations
+
+import ipaddress
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+
+networks: list[ipaddress.IPv4Network] = []
+
+for raw_line in source.read_text(encoding="utf-8", errors="replace").splitlines():
+    line = raw_line.split("#", 1)[0].strip()
+
+    if not line:
+        continue
+
+    try:
+        network = ipaddress.ip_network(line, strict=False)
+    except ValueError:
+        continue
+
+    if network.version == 4:
+        networks.append(network)
+
+if len(networks) < 1000:
+    raise SystemExit(
+        f"Список выглядит неполным: найдено только {len(networks)} IPv4-сетей"
+    )
+
+collapsed = list(ipaddress.collapse_addresses(networks))
+
+destination.write_text(
+    "\n".join(str(network) for network in collapsed) + "\n",
+    encoding="utf-8",
+)
+
+print(
+    f"Исходных IPv4-сетей: {len(networks)}; "
+    f"после объединения: {len(collapsed)}"
+)
+PY
+
+    install -m 0644 "$compact" "$RU_CACHE"
+    rm -f "$raw" "$compact"
+
+    log "кеш российских сетей обновлён"
+}
+
+generate_nft_file() {
+    python3 - "$RU_CACHE" "$NFT_FILE" <<'PY'
+from __future__ import annotations
+
+import ipaddress
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+
+networks: list[str] = []
+
+for raw_line in source.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+
+    if not line:
+        continue
+
+    network = ipaddress.ip_network(line, strict=False)
+
+    if network.version == 4:
+        networks.append(str(network))
+
+if not networks:
+    raise SystemExit("Список российских IPv4-сетей пуст")
+
+with destination.open("w", encoding="utf-8") as stream:
+    stream.write("table inet rockyray {\n")
+    stream.write("    set ru4 {\n")
+    stream.write("        type ipv4_addr\n")
+    stream.write("        flags interval\n")
+    stream.write("        elements = {\n")
+
+    for index, network in enumerate(networks):
+        comma = "," if index < len(networks) - 1 else ""
+        stream.write(f"            {network}{comma}\n")
+
+    stream.write("        }\n")
+    stream.write("    }\n")
+    stream.write("\n")
+    stream.write("    chain output {\n")
+    stream.write("        type route hook output priority mangle; policy accept;\n")
+    stream.write(
+        "        ip daddr @ru4 counter "
+        "meta mark set 0x5252\n"
+    )
+    stream.write("    }\n")
+    stream.write("}\n")
+PY
+}
+
+up_impl() {
+    local gateway="${1:-}"
+    local interface="${2:-}"
+
+    if ip -4 addr show dev lo | grep -Fq "$DIRECT_SOURCE_IP" &&
+       [[ ! -e "$DIRECT_STATE_FILE" ]]
+    then
+        log "адрес direct-outbound уже используется другим владельцем"
+        down_impl
+        return 1
+    fi
+
+    # Always remove state from a crashed/partial previous start first.
+    down_impl
+    trap 'down_impl' ERR
+
+    python3 - "$gateway" <<'PY'
+import ipaddress
+import sys
+
+try:
+    value = ipaddress.ip_address(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit(f"Некорректный шлюз: {exc}")
+
+if value.version != 4:
+    raise SystemExit("Требуется IPv4-шлюз")
+PY
+
+    if [[ ! "$interface" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+        log "некорректное имя интерфейса: ${interface}"
+        return 1
+    fi
+
+    if ! ip link show dev "$interface" >/dev/null 2>&1; then
+        log "интерфейс ${interface} не найден"
+        return 1
+    fi
+
+    if ! enable_loose_rp_filter "$interface"; then
+        down_impl
+        return 1
+    fi
+
+    if ! install -m 0600 /dev/null "$DIRECT_STATE_FILE"; then
+        log "не удалось создать marker direct-outbound"
+        down_impl
+        return 1
+    fi
+
+    if ! ip -4 addr add "$DIRECT_SOURCE_CIDR" dev lo; then
+        rm -f "$DIRECT_STATE_FILE"
+        log "не удалось создать адрес direct-outbound"
+        down_impl
+        return 1
+    fi
+
+    refresh_cache
+    generate_nft_file
+
+    # Создаём отдельную таблицу с физическим подключением.
+    while IFS= read -r route_line; do
+        [[ -z "$route_line" ]] && continue
+        [[ "$route_line" == default* ]] && continue
+        [[ "$route_line" == *"dev utun777"* ]] && continue
+
+        if [[ "$route_line" == *" dev ${interface} "* ||
+              "$route_line" == *" dev ${interface}" ]]
+        then
+            # Разбиение строки здесь намеренное: это аргументы команды ip.
+            # shellcheck disable=SC2086
+            ip -4 route replace table "$ROUTE_TABLE" $route_line || true
+        fi
+    done < <(ip -4 route show table main)
+
+    if ! ip -4 route replace \
+        table "$ROUTE_TABLE" \
+        default via "$gateway" dev "$interface"
+    then
+        if ! ip -4 route replace \
+            table "$ROUTE_TABLE" \
+            default via "$gateway" dev "$interface" onlink
+        then
+            log "не удалось создать direct-таблицу маршрутизации"
+            down_impl
+            return 1
+        fi
+    fi
+
+    if ! ip -4 rule add \
+        priority "$RULE_PRIORITY" \
+        fwmark "${MARK}/0xffffffff" \
+        table "$ROUTE_TABLE"
+    then
+        log "не удалось добавить правило для маркированного трафика"
+        down_impl
+        return 1
+    fi
+
+    if ! ip -4 rule add \
+        priority "$SOURCE_RULE_PRIORITY" \
+        from "$DIRECT_SOURCE_CIDR" \
+        table "$ROUTE_TABLE" \
+        protocol "$SOURCE_RULE_PROTOCOL"
+    then
+        log "не удалось добавить правило для direct-outbound"
+        down_impl
+        return 1
+    fi
+
+    if ! nft -f "$NFT_FILE"; then
+        log "не удалось применить nftables"
+        down_impl
+        return 1
+    fi
+
+    if ! nft add chain "$NFT_FAMILY" "$NFT_TABLE" postrouting '{ type nat hook postrouting priority srcnat; policy accept; }'; then
+        log "не удалось создать NAT-цепочку postrouting"
+        down_impl
+        return 1
+    fi
+
+    if ! nft add rule "$NFT_FAMILY" "$NFT_TABLE" postrouting ip saddr "$DIRECT_SOURCE_IP" oifname "$interface" masquerade comment '"rockyray-direct-snat"'; then
+        log "не удалось добавить SNAT для direct-outbound"
+        down_impl
+        return 1
+    fi
+
+    if ! nft add rule "$NFT_FAMILY" "$NFT_TABLE" postrouting meta mark "$MARK" oifname "$interface" masquerade comment '"rockyray-ru-snat"'; then
+        log "не удалось добавить SNAT для прямого российского трафика"
+        down_impl
+        return 1
+    fi
+
+    if ! ip -4 rule show |
+        grep -F "fwmark ${MARK}/0xffffffff lookup ${ROUTE_TABLE}" >/dev/null; then
+        log "policy-правило fwmark ${MARK} не применилось"
+        down_impl
+        return 1
+    fi
+
+    if ! ip -4 rule show |
+        grep -F "from ${DIRECT_SOURCE_CIDR} lookup ${ROUTE_TABLE}" >/dev/null; then
+        log "policy-правило для direct-outbound не применилось"
+        down_impl
+        return 1
+    fi
+
+    if ! ip -4 route show table "${ROUTE_TABLE}" |
+        grep -F "default via ${gateway} dev ${interface}" >/dev/null; then
+        log "таблица ${ROUTE_TABLE} не получила default route"
+        down_impl
+        return 1
+    fi
+
+    if ! ip -4 addr show dev lo | grep -Fq "${DIRECT_SOURCE_IP}"; then
+        log "lo direct-outbound адрес не применился"
+        down_impl
+        return 1
+    fi
+
+    ip -4 route flush cache 2>/dev/null || true
+    trap - ERR
+
+    log "российские IPv4 направляются через ${gateway}/${interface}"
+}
+
+status_impl() {
+    echo "=== Правило policy routing ==="
+    ip -4 rule show | grep -E 'fwmark 0x5252.*lookup 5252' || true
+
+    if ip -4 rule show | grep -Eq "^101:.*from ${DIRECT_SOURCE_IP}.*lookup 5252.*proto 242" &&
+       ip -4 addr show dev lo | grep -Fq "$DIRECT_SOURCE_IP" &&
+       [[ -e "$DIRECT_STATE_FILE" ]] &&
+       nft list chain "$NFT_FAMILY" "$NFT_TABLE" postrouting 2>/dev/null |
+           grep -Fq 'rockyray-direct-snat'
+    then
+        echo "Правило direct-outbound: установлено"
+    else
+        echo "Правило direct-outbound: отсутствует"
+    fi
+
+    echo
+    echo "=== Таблица 5252 ==="
+    ip -4 route show table "$ROUTE_TABLE" || true
+
+    echo
+    echo "=== nftables ==="
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" 2>/dev/null | sed -n '1,80p' || true
+
+    echo
+    echo "=== Кеш сетей ==="
+    if [[ -s "$RU_CACHE" ]]; then
+        stat "$RU_CACHE"
+        echo "Количество диапазонов: $(wc -l < "$RU_CACHE")"
+    else
+        echo "Кеш отсутствует"
+    fi
+}
+
+case "${1:-}" in
+    up)
+        [[ "$#" -eq 3 ]] || {
+            echo "Использование: $0 up ШЛЮЗ ИНТЕРФЕЙС" >&2
+            exit 2
+        }
+
+        up_impl "$2" "$3"
+        ;;
+
+    down)
+        down_impl
+        log "раздельная маршрутизация отключена"
+        ;;
+
+    refresh)
+        refresh_cache
+        ;;
+
+    status)
+        status_impl
+        ;;
+
+    *)
+        echo "Использование: $0 {up ШЛЮЗ ИНТЕРФЕЙС|down|refresh|status}" >&2
+        exit 2
+        ;;
+esac

@@ -441,26 +441,33 @@ class AppMainWindow(AppQMainWindow):
             ),
         ]
 
+        # RockyRay: compact Settings menu
+        settingsActions = [
+            AppQAction(
+                'Серверы',
+                icon=bootstrapIcon('server.svg'),
+                menu=AppQMenu(*serverActions),
+                checkable=False,
+            ),
+            AppQAction(
+                'Журнал событий',
+                icon=bootstrapIcon('pin-angle.svg'),
+                menu=AppQMenu(*logActions),
+                checkable=False,
+            ),
+            AppQSeperator(),
+            *toolsActions,
+            AppQSeperator(),
+            AppQAction(
+                'О программе',
+                icon=bootstrapIcon('info-circle.svg'),
+                checkable=False,
+                callback=lambda: self.openAboutPage(),
+            ),
+        ]
+
         if hasattr(AppQAction, 'setMenu'):
             self.toolbar = AppQToolBar(
-                AppQAction(
-                    _('Log'),
-                    icon=bootstrapIcon('pin-angle.svg'),
-                    menu=AppQMenu(*logActions),
-                    useSetMenu=False,
-                    useActionGroup=False,
-                    checkable=False,
-                ),
-                AppQSeperator(),
-                AppQAction(
-                    _('Server'),
-                    icon=bootstrapIcon('server.svg'),
-                    menu=AppQMenu(*serverActions),
-                    useSetMenu=False,
-                    useActionGroup=False,
-                    checkable=False,
-                ),
-                AppQSeperator(),
                 AppQAction(
                     _('Subscription'),
                     icon=bootstrapIcon('collection.svg'),
@@ -478,9 +485,9 @@ class AppMainWindow(AppQMainWindow):
                 ),
                 AppQSeperator(),
                 AppQAction(
-                    _('Tools'),
+                    'Настройки',
                     icon=bootstrapIcon('tools.svg'),
-                    menu=AppQMenu(*toolsActions),
+                    menu=AppQMenu(*settingsActions),
                     useSetMenu=False,
                     useActionGroup=False,
                     checkable=False,
@@ -491,13 +498,6 @@ class AppMainWindow(AppQMainWindow):
                     icon=bootstrapIcon('download.svg'),
                     checkable=False,
                     callback=lambda: self.checkForUpdates(parent=self),
-                ),
-                AppQSeperator(),
-                AppQAction(
-                    _('About'),
-                    icon=bootstrapIcon('info-circle.svg'),
-                    checkable=False,
-                    callback=lambda: self.openAboutPage(),
                 ),
             )
             self.toolbar.setObjectName('AppMainWindow_AppQToolBar')
@@ -577,6 +577,22 @@ class AppMainWindow(AppQMainWindow):
         self.networkState = NetworkStateBadge(parent=self)
 
         self.statusBar().addPermanentWidget(self.networkState)
+
+        self.stopSubscriptionTasksButton = AppQPushButton()
+        self.stopSubscriptionTasksButton.setText(_('Stop'))
+        self.stopSubscriptionTasksButton.setIcon(bootstrapIcon('stop-btn.svg'))
+        self.stopSubscriptionTasksButton.setToolTip(
+            _('Stop updating subscriptions or testing related tasks')
+        )
+        self.stopSubscriptionTasksButton.setVisible(False)
+        self.stopSubscriptionTasksButton.clicked.connect(self.stopSubscriptionMaintenanceJobs)
+        self.statusBar().addPermanentWidget(self.stopSubscriptionTasksButton)
+
+        self.subscriptionMaintenancePollTimer = QtCore.QTimer(self)
+        self.subscriptionMaintenancePollTimer.timeout.connect(
+            self.refreshSubscriptionMaintenanceButtonState
+        )
+        self.subscriptionMaintenancePollTimer.start(350)
 
         self._widget = QWidget()
         self._layout = QVBoxLayout(self._widget)
@@ -778,6 +794,41 @@ class AppMainWindow(AppQMainWindow):
         else:
             self.setWindowTitle(f'{_(APPLICATION_NAME)}')
 
+        try:
+            self.stopSubscriptionTasksButton.setText(_('Stop'))
+            self.stopSubscriptionTasksButton.setToolTip(
+                _('Stop updating subscriptions or testing related tasks')
+            )
+        except Exception:
+            # Any non-exit exceptions
+
+            pass
+
     def cleanup(self):
         AppSettings.set('AppMainWindowGeometry', self.saveGeometry())
         AppSettings.set('AppMainWindowState', self.saveState())
+
+        try:
+            self.subscriptionMaintenancePollTimer.stop()
+        except Exception:
+            # Any non-exit exceptions
+
+            pass
+
+    @QtCore.Slot()
+    def refreshSubscriptionMaintenanceButtonState(self):
+        try:
+            running = (
+                self.userServersQTableWidget.hasActiveSubscriptionMaintenanceJobs()
+            )
+        except Exception:
+            # Any non-exit exceptions
+
+            running = False
+
+        self.stopSubscriptionTasksButton.setVisible(bool(running))
+        self.stopSubscriptionTasksButton.setEnabled(bool(running))
+
+    def stopSubscriptionMaintenanceJobs(self):
+        self.userServersQTableWidget.cancelActiveSubscriptionMaintenanceJobs()
+        self.refreshSubscriptionMaintenanceButtonState()

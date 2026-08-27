@@ -50,6 +50,59 @@ class ConfigFactory(UserServersTableItem, dict):
         self._index = kwargs.pop('index', 0)
         self._deleted = kwargs.pop('deleted', False)
 
+        # RockyRay: extract display name from JSON subscription
+        #
+        # Полные JSON-конфигурации Liberty содержат название профиля
+        # внутри самого JSON, тогда как Furious показывает название
+        # из служебного поля kwargs["remark"].
+        metadataKeys = (
+            'remarks',
+            'remark',
+            'name',
+            'ps',
+            'title',
+        )
+
+        jsonObject = None
+
+        if isinstance(config, dict):
+            jsonObject = copy.deepcopy(config)
+
+        elif isinstance(config, str):
+            try:
+                candidate = ujson.loads(config)
+            except Exception:
+                candidate = None
+
+            if isinstance(candidate, dict):
+                jsonObject = candidate
+
+        if isinstance(jsonObject, dict):
+            currentRemark = str(
+                kwargs.get('remark') or ''
+            ).strip()
+
+            if not currentRemark:
+                for key in metadataKeys:
+                    value = jsonObject.get(key)
+
+                    if isinstance(value, str) and value.strip():
+                        kwargs['remark'] = value.strip()
+                        break
+
+            # Поля названия относятся к приложению, а не к Xray-core.
+            # Удаляем их из запускаемой конфигурации.
+            for key in metadataKeys:
+                jsonObject.pop(key, None)
+
+            if isinstance(config, str):
+                config = ujson.dumps(
+                    jsonObject,
+                    ensure_ascii=False,
+                )
+            else:
+                config = jsonObject
+
         # Extra attributes
         self.kwargs = kwargs
 

@@ -262,7 +262,13 @@ class ConnectAction(AppQAction):
                         proxyServerBypass = PROXY_SERVER_BYPASS
 
                     try:
-                        SystemProxy.set(httpProxy, proxyServerBypass)
+                        if SystemRuntime.isTUNMode():
+                            SystemProxy.off()
+                            logger.info(
+                                'TUN mode active: skipped system proxy configuration'
+                            )
+                        else:
+                            SystemProxy.set(httpProxy, proxyServerBypass)
                     except Exception as ex:
                         # Any non-exit exceptions
 

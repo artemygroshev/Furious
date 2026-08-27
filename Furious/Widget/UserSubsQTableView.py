@@ -367,6 +367,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
                     )
 
                     Storage.UserSubs().pop(deleteUnique)
+                    Storage.UserSubs().sync()
 
                     # Begin timer cleanup
                     qtimer = self.timers[deleteIndex]
@@ -613,6 +614,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
         if unique in Storage.UserSubs():
             row = list(Storage.UserSubs().keys()).index(unique)
             Storage.UserSubs().update(subsob)
+            Storage.UserSubs().sync()
             self.flushRow(row, subsob[unique])
         else:
             row = self.sourceModel.rowCount()
@@ -623,6 +625,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
 
             self.sourceModel.beginInsertRows(QtCore.QModelIndex(), row, row)
             Storage.UserSubs().update(subsob)
+            Storage.UserSubs().sync()
             self.sourceModel.endInsertRows()
 
             self.flushRow(row, subsob[unique])

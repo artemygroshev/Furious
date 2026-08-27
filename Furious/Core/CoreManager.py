@@ -34,10 +34,36 @@ import uuid
 import logging
 import tempfile
 import functools
+import subprocess
+import ipaddress
+import shlex
 
-__all__ = ['cleanRoutingRule', 'CoreManager']
+__all__ = ['cleanRoutingRule', 'configureLinuxTunAnyDeskBypass', 'CoreManager']
 
 logger = logging.getLogger(__name__)
+
+ROCKYRAY_ANYDESK_DOMAIN = 'domain:net.anydesk.com'
+ROCKYRAY_ANYDESK_OUTBOUND_TAG = 'rockyray-anydesk-direct'
+ROCKYRAY_ANYDESK_RULE_TAG = 'rockyray-anydesk-direct'
+ROCKYRAY_DIRECT_SOURCE_IP = '169.254.252.82'
+ROCKYRAY_SPLIT_ROUTING_HELPER = '/usr/local/sbin/rockyray-split-routing'
+
+
+def resolveSplitRoutingHelper() -> str:
+    localProjectHelper = os.path.normpath(
+        os.path.join(
+            os.path.dirname(__file__), '..', '..', 'tools', 'rockyray-split-routing'
+        )
+    )
+
+    if (
+        os.path.exists(localProjectHelper)
+        and os.path.isfile(localProjectHelper)
+        and os.access(localProjectHelper, os.X_OK)
+    ):
+        return localProjectHelper
+
+    return ROCKYRAY_SPLIT_ROUTING_HELPER
 
 
 def fixLogObjectPath(config: ConfigFactory, attr: str, value: str, log=True):
@@ -140,9 +166,13 @@ def customRoutingObjectFromSettings(routing: str):
     routingProfile = Storage.UserRoutings().get(unique)
 
     if not isinstance(routingProfile, dict):
+        logger.warning(f'custom routing profile {routing!r} is unavailable')
         return None
 
     if not routingProfile.get('enabled', True):
+        logger.warning(
+            f'custom routing profile {routing!r} is disabled, fallback to global routing'
+        )
         return None
 
     domainStrategy = routingProfile.get('domainStrategy', 'AsIs')
@@ -150,10 +180,18 @@ def customRoutingObjectFromSettings(routing: str):
     if domainStrategy not in ['AsIs', 'IPIfNonMatch', 'IPOnDemand']:
         domainStrategy = 'AsIs'
 
+    rawRules = routingProfile.get('rules', [])
+    if not isinstance(rawRules, list):
+        logger.warning(
+            f'custom routing profile {routing!r} has invalid rules type '
+            f'({type(rawRules)}), ignoring them'
+        )
+        rawRules = []
+
     rules = list(
         filter(
             lambda rule: rule is not None,
-            list(cleanRoutingRule(rule) for rule in routingProfile.get('rules', [])),
+            list(cleanRoutingRule(rule) for rule in rawRules),
         )
     )
 
@@ -175,6 +213,128 @@ def routingObjectHasDirectRule(routingObject: dict) -> bool:
         # Any non-exit exceptions
 
         return False
+
+
+def configureLinuxTunAnyDeskBypass(
+    config: dict,
+    routingObject: dict,
+    sourceIP: str,
+) -> bool:
+    """Route AnyDesk outside the Linux TUN without granting Xray capabilities."""
+
+    try:
+        sourceAddress = ipaddress.ip_address(sourceIP)
+    except (TypeError, ValueError):
+        return False
+
+    if sourceAddress.version != 4:
+        return False
+
+    inbounds = config.get('inbounds')
+    outbounds = config.get('outbounds')
+
+    if (
+        not isinstance(inbounds, list)
+        or not isinstance(outbounds, list)
+        or not isinstance(routingObject, dict)
+    ):
+        return False
+
+    socksInbound = next(
+        (
+            inbound
+            for inbound in inbounds
+            if isinstance(inbound, dict) and inbound.get('protocol') == 'socks'
+        ),
+        None,
+    )
+
+    if socksInbound is None:
+        return False
+
+    sniffing = socksInbound.get('sniffing')
+
+    if sniffing is None:
+        sniffing = {}
+    elif not isinstance(sniffing, dict):
+        return False
+
+    destOverride = sniffing.get('destOverride')
+
+    if destOverride is None:
+        destOverride = []
+    elif not isinstance(destOverride, list):
+        return False
+
+    if not all(isinstance(item, str) for item in destOverride):
+        return False
+
+    rules = routingObject.get('rules')
+
+    if rules is None:
+        rules = []
+    elif not isinstance(rules, list):
+        return False
+
+    # Keep this outbound dedicated to AnyDesk. Binding a local source address
+    # does not require CAP_NET_ADMIN; the system policy rule installed by
+    # rockyray-split-routing sends that source through the physical gateway.
+    anydeskOutbound = {
+        'tag': ROCKYRAY_ANYDESK_OUTBOUND_TAG,
+        'protocol': 'freedom',
+        'sendThrough': str(sourceAddress),
+        'settings': {
+            'domainStrategy': 'UseIPv4',
+        },
+    }
+
+    outbounds[:] = list(
+        outbound
+        for outbound in outbounds
+        if not (
+            isinstance(outbound, dict)
+            and outbound.get('tag') == ROCKYRAY_ANYDESK_OUTBOUND_TAG
+        )
+    )
+    outbounds.append(anydeskOutbound)
+
+    sniffing = dict(sniffing)
+    sniffing['enabled'] = True
+    sniffing['destOverride'] = list(
+        dict.fromkeys([*destOverride, 'http', 'tls'])
+    )
+    # The sniffed name must replace the original IP. Otherwise any process
+    # could present an AnyDesk SNI while retaining an arbitrary destination
+    # and inherit the physical-route bypass.
+    sniffing['metadataOnly'] = False
+    sniffing['routeOnly'] = False
+    sniffing['domainsExcluded'] = []
+    sniffing['ipsExcluded'] = []
+    socksInbound['sniffing'] = sniffing
+
+    rules = list(
+        rule
+        for rule in rules
+        if not (
+            isinstance(rule, dict)
+            and rule.get('ruleTag') == ROCKYRAY_ANYDESK_RULE_TAG
+        )
+    )
+    rules.insert(
+        0,
+        {
+            'type': 'field',
+            'ruleTag': ROCKYRAY_ANYDESK_RULE_TAG,
+            'domain': [ROCKYRAY_ANYDESK_DOMAIN],
+            'outboundTag': ROCKYRAY_ANYDESK_OUTBOUND_TAG,
+        },
+    )
+
+    routingObject.setdefault('domainStrategy', 'AsIs')
+    routingObject.setdefault('domainMatcher', 'hybrid')
+    routingObject['rules'] = rules
+
+    return True
 
 
 def getUserTUNSettings(*args, **kwargs):
@@ -235,6 +395,9 @@ class CoreManager(Mixins.CleanupOnExit):
         log=True,
         **kwargs,
     ):
+        linuxTunDirectSourceIP = kwargs.pop('linuxTunDirectSourceIP', '')
+        customRoutingObject = customRoutingObjectFromSettings(routing)
+
         if config.get('log') is None or not isinstance(config['log'], dict):
             config['log'] = {
                 'access': '',
@@ -290,24 +453,46 @@ class CoreManager(Mixins.CleanupOnExit):
             }
         elif routing == AppBuiltinRouting.Global.value:
             routingObject = {}
-        elif customRoutingObjectFromSettings(routing) is not None:
-            routingObject = customRoutingObjectFromSettings(routing)
+        elif customRoutingObject is not None:
+            if (
+                not proxyModeOnly
+                and SystemRuntime.isTUNMode()
+                and routingObjectHasDirectRule(customRoutingObject)
+            ):
+                logger.warning(
+                    f'custom routing profile {routing!r} contains direct rules, disallowed '
+                    'under TUN mode'
+                )
+                showMBoxDirectRulesNotAllowed()
 
-            #
-            # TODO: Warning: no check for custom routing
-            #
-            # if (
-            #     routingObjectHasDirectRule(routingObject)
-            #     and not proxyModeOnly
-            #     and SystemRuntime.isTUNMode()
-            # ):
-            #     showMBoxDirectRulesNotAllowed()
-            #
-            #     return None, False
+                return None, False
+
+            routingObject = customRoutingObject
         elif routing == AppBuiltinRouting.Custom.value:
             routingObject = config.get('routing', {})
+            if not isinstance(routingObject, dict):
+                logger.warning(
+                    f'custom routing configuration for {XrayCore.name()} is not a dict: '
+                    f'{type(routingObject)}'
+                )
+                routingObject = {}
         else:
+            if isinstance(routing, str) and routing.startswith('Custom:'):
+                logger.warning(
+                    f'custom routing profile {routing!r} is unavailable; '
+                    'using global routing'
+                )
+
             routingObject = {}
+
+        if linuxTunDirectSourceIP and not configureLinuxTunAnyDeskBypass(
+            config,
+            routingObject,
+            linuxTunDirectSourceIP,
+        ):
+            logger.error('failed to configure the Linux TUN AnyDesk bypass')
+
+            return None, False
 
         if log:
             logger.info(f'core {XrayCore.name()} configured')
@@ -434,6 +619,14 @@ class CoreManager(Mixins.CleanupOnExit):
 
             return False
 
+        if (
+            isinstance(configcopy, ConfigXray)
+            and PLATFORM == 'Linux'
+            and not proxyModeOnly
+            and SystemRuntime.isTUNMode()
+        ):
+            kwargs['linuxTunDirectSourceIP'] = ROCKYRAY_DIRECT_SOURCE_IP
+
         process, success = self._startCore(
             configcopy,
             routing,
@@ -493,12 +686,54 @@ class CoreManager(Mixins.CleanupOnExit):
                         )
                     )
 
-                if len(defaultGateway) != 1:
-                    return abortStart(f'bad default gateway: {defaultGateway}')
+                if PLATFORM == 'Windows':
+                    if len(defaultGateway) == 0:
+                        return abortStart(f'bad default gateway: {defaultGateway}')
 
-                if PLATFORM == 'Windows' or PLATFORM == 'Linux':
-                    # On Linux the 'interface' is a name
+                    if len(defaultGateway) > 1:
+                        logger.warning(
+                            f'multiple Windows default gateways found: {defaultGateway}'
+                        )
+
                     gateway, interface = defaultGateway[0]
+                elif PLATFORM == 'Linux':
+                    if not isinstance(defaultGateway, list):
+                        defaultGateway = list(defaultGateway)
+
+                    defaultGatewayList = list(
+                        item
+                        for item in defaultGateway
+                        if isinstance(item, (list, tuple))
+                        and len(item) == 2
+                    )
+
+                    if not defaultGatewayList:
+                        return abortStart(f'bad default gateway: {defaultGateway}')
+
+                    linuxCandidates = list(
+                        item
+                        for item in defaultGatewayList
+                        if item[1] != APPLICATION_TUN_DEVICE_NAME
+                        and item[1] != 'lo'
+                        and item[0] != APPLICATION_TUN_GATEWAY_ADDRESS
+                    )
+
+                    if linuxCandidates:
+                        if len(linuxCandidates) > 1:
+                            logger.warning(
+                                'multiple Linux default gateways found, selecting first '
+                                'non-TUN candidate'
+                            )
+
+                        gateway, interface = linuxCandidates[0]
+                    else:
+                        if len(defaultGatewayList) > 1:
+                            logger.warning(
+                                'all Linux default gateways are TUN/loopback candidates, '
+                                f'using first: {defaultGatewayList}'
+                            )
+
+                        gateway, interface = defaultGatewayList[0]
                 elif PLATFORM == 'Darwin':
                     gateway, interface = defaultGateway[0], None
                 else:
@@ -726,7 +961,35 @@ class CoreManager(Mixins.CleanupOnExit):
             if PLATFORM == 'Linux':
 
                 def _linuxCleanup():
-                    SystemRoutingTable.LinuxDeleteTUNDevice(APPLICATION_TUN_DEVICE_NAME)
+                    try:
+                        result = subprocess.run(
+                            [
+                                'sudo',
+                                '-n',
+                                resolveSplitRoutingHelper(),
+                                'down',
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            check=False,
+                        )
+
+                        if result.returncode != 0:
+                            logger.warning(
+                                'RockyRay split routing cleanup failed: '
+                                + result.stderr.decode(
+                                    'utf-8',
+                                    'replace',
+                                ).strip()
+                            )
+                    except Exception as ex:
+                        logger.warning(
+                            f'RockyRay split routing cleanup failed: {ex}'
+                        )
+
+                    SystemRoutingTable.LinuxDeleteTUNDevice(
+                        APPLICATION_TUN_DEVICE_NAME
+                    )
 
                 tun.cleanup = functools.partial(_linuxCleanup)
 
@@ -748,6 +1011,16 @@ class CoreManager(Mixins.CleanupOnExit):
                         f'ip addr add 10.10.10.10/24 dev {APPLICATION_TUN_DEVICE_NAME}\n'
                         f'ip link set dev {APPLICATION_TUN_DEVICE_NAME} up'
                     )
+
+                commandSplitRouting = ' '.join(
+                    shlex.quote(str(argument))
+                    for argument in (
+                        resolveSplitRoutingHelper(),
+                        'up',
+                        gateway,
+                        interface,
+                    )
+                )
 
                 commandAddDefaultRoute = (
                     f'ip route add default dev {APPLICATION_TUN_DEVICE_NAME} metric 5'
@@ -777,7 +1050,12 @@ class CoreManager(Mixins.CleanupOnExit):
                     content = '\n'.join(
                         filter(
                             lambda x: x != '',
-                            [commandBringUpTUN, commandAddDefaultRoute, commandBypass],
+                            [
+                                commandBringUpTUN,
+                                commandSplitRouting,
+                                commandAddDefaultRoute,
+                                commandBypass,
+                            ],
                         )
                     )
 

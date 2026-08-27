@@ -408,14 +408,19 @@ class SystemRoutingTable:
     def LinuxExecutePrivilegedScript(filepath, shell='bash') -> bool:
         assert PLATFORM == 'Linux'
 
-        command = 'pkexec'
+        # This installation uses a local administrator account without a
+        # password. PolicyKit rejects passwordless accounts, while sudo's PAM
+        # policy accepts the account's empty password. Keep the password on
+        # stdin and suppress the prompt so GUI launches do not require a TTY.
+        command = ['sudo', '-S', '-p', '', '--']
 
         if SystemRuntime.flatpakID():
-            command = 'flatpak-spawn --host ' + command
+            command = ['flatpak-spawn', '--host'] + command
 
         try:
             result = runExternalCommand(
-                command.split() + [shell, filepath],
+                command + [shell, filepath],
+                input=b'\n',
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=True,
