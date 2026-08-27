@@ -47,6 +47,10 @@ ROCKYRAY_ANYDESK_OUTBOUND_TAG = 'rockyray-anydesk-direct'
 ROCKYRAY_ANYDESK_RULE_TAG = 'rockyray-anydesk-direct'
 ROCKYRAY_DIRECT_SOURCE_IP = '169.254.252.82'
 ROCKYRAY_SPLIT_ROUTING_HELPER = '/usr/local/sbin/rockyray-split-routing'
+ROCKYRAY_ROUTING_TABLE = '5252'
+ROCKYRAY_ROUTING_RULE_PRIORITY = '100'
+ROCKYRAY_ROUTING_SOURCE_RULE_PRIORITY = '101'
+ROCKYRAY_ROUTING_RULE_MARK = '0x5252'
 
 
 def resolveSplitRoutingHelper() -> str:
@@ -88,6 +92,93 @@ def validateLinuxTunRoutingPrerequisites(interface: str, gateway: str) -> tuple[
 
     if not os.access(helper, os.X_OK):
         return False, f'split-routing helper is not executable: {helper!r}'
+
+    return True, ''
+
+
+def _containsLine(text: str, needle: str) -> bool:
+    return needle in text
+
+
+def _linuxRoutingSanityCheck(interface: str, gateway: str) -> tuple[bool, str]:
+    try:
+        routeTable = SystemRoutingTable.LinuxGetIpRoute(ROCKYRAY_ROUTING_TABLE)
+    except Exception as ex:
+        return False, f'unable to inspect route table {ROCKYRAY_ROUTING_TABLE}: {ex}'
+
+    expectedRoute = f'default via {gateway} dev {interface}'
+
+    if not _containsLine(routeTable, expectedRoute):
+        return False, (
+            f'route table check failed: missing \"{expectedRoute}\" in table '
+            f'{ROCKYRAY_ROUTING_TABLE}'
+        )
+
+    try:
+        rules = runExternalCommand(
+            ['ip', '-4', 'rule', 'show'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout.decode('utf-8', 'replace')
+    except Exception as ex:
+        return False, f'unable to inspect ip rules: {ex}'
+
+    ruleByMark = f'{ROCKYRAY_ROUTING_RULE_PRIORITY}:'
+    ruleByMarkMatcher = (
+        f'{ruleByMark} from all fwmark {ROCKYRAY_ROUTING_RULE_MARK} lookup {ROCKYRAY_ROUTING_TABLE}'
+    )
+    ruleByMarkMaskMatcher = (
+        f'{ruleByMark} from all fwmark {ROCKYRAY_ROUTING_RULE_MARK}/0xffffffff '
+        f'lookup {ROCKYRAY_ROUTING_TABLE}'
+    )
+    sourceRuleByPriority = f'{ROCKYRAY_ROUTING_SOURCE_RULE_PRIORITY}:'
+    sourceRuleByMarker = (
+        f'{sourceRuleByPriority} from {ROCKYRAY_DIRECT_SOURCE_IP}/32 '
+        f'lookup {ROCKYRAY_ROUTING_TABLE}'
+    )
+    sourceRuleByProtocol = (
+        f'{sourceRuleByPriority}: from {ROCKYRAY_DIRECT_SOURCE_IP}/32 '
+        f'lookup {ROCKYRAY_ROUTING_TABLE} proto 242'
+    )
+
+    if not (
+        _containsLine(rules, ruleByMarkMatcher)
+        or _containsLine(rules, ruleByMarkMaskMatcher)
+        or (
+            _containsLine(rules, ruleByMark)
+            and _containsLine(rules, ROCKYRAY_ROUTING_RULE_MARK)
+            and _containsLine(rules, ROCKYRAY_ROUTING_TABLE)
+        )
+    ):
+        return False, 'policy routing check failed: missing fwmark route rule'
+
+    if not _containsLine(rules, ruleByMark):
+        return False, f'policy routing check failed: missing priority {ROCKYRAY_ROUTING_RULE_PRIORITY}'
+
+    if not (
+        _containsLine(rules, sourceRuleByMarker)
+        or _containsLine(rules, sourceRuleByProtocol)
+        or (
+            _containsLine(rules, sourceRuleByPriority)
+            and _containsLine(rules, ROCKYRAY_DIRECT_SOURCE_IP)
+            and _containsLine(rules, ROCKYRAY_ROUTING_TABLE)
+        )
+    ):
+        return False, 'policy routing check failed: missing direct-outbound source rule marker'
+
+    try:
+        loAddress = runExternalCommand(
+            ['ip', '-4', 'addr', 'show', 'dev', 'lo'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        ).stdout.decode('utf-8', 'replace')
+    except Exception as ex:
+        return False, f'unable to inspect loopback addresses: {ex}'
+
+    if not _containsLine(loAddress, ROCKYRAY_DIRECT_SOURCE_IP):
+        return False, 'direct-outbound loopback address is not present'
 
     return True, ''
 
@@ -1105,11 +1196,16 @@ class CoreManager(Mixins.CleanupOnExit):
                     ):
                         return abortStart('failed to apply split-routing rules')
 
-                    if not self.waitForTUNDeviceBroughtUp(
-                        SystemRoutingTable.LinuxFindTUNDevice,
-                        APPLICATION_TUN_DEVICE_NAME,
-                    ):
-                        return abortStart('failed to bring TUN device up')
+                if not self.waitForTUNDeviceBroughtUp(
+                    SystemRoutingTable.LinuxFindTUNDevice,
+                    APPLICATION_TUN_DEVICE_NAME,
+                ):
+                    return abortStart('failed to bring TUN device up')
+
+                canRoute, reason = _linuxRoutingSanityCheck(interface, gateway)
+
+                if not canRoute:
+                    return abortStart(f'failed Linux routing sanity check: {reason}')
 
                 # Now bring up TUN
                 if not startTUN():

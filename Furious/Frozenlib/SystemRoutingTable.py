@@ -472,10 +472,13 @@ class SystemRoutingTable:
             return True
 
     @staticmethod
-    def LinuxGetIpRoute() -> str:
+    def LinuxGetIpRoute(routeTable: str = 'main') -> str:
         assert PLATFORM == 'Linux'
 
         command = 'ip route show'
+
+        if routeTable:
+            command = f'{command} table {routeTable}'
 
         if SystemRuntime.flatpakID():
             command = 'flatpak-spawn --host ' + command
