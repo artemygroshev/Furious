@@ -24,6 +24,7 @@ from Furious.Frozenlib.SystemRuntime import *
 import re
 import logging
 import subprocess
+import shutil
 
 __all__ = ['SystemRoutingTable']
 
@@ -58,6 +59,30 @@ class SystemRoutingTable:
     DEFAULT_GATEWAY_LINUX = re.compile(
         r'default\s+via\s+(\S+)\s+dev\s+(\S+)',
     )
+
+    @staticmethod
+    def commandExists(command: str) -> bool:
+        if not isinstance(command, str) or not command.strip():
+            return False
+
+        try:
+            return shutil.which(command.strip()) is not None
+        except Exception:
+            # Any non-exit exceptions
+
+            return False
+
+    @staticmethod
+    def linuxRouteToolkitMissingCommands() -> list[str]:
+        commands = [
+            'ip',
+            'nft',
+            'python3',
+            'curl',
+            'sudo',
+        ]
+
+        return list(command for command in commands if not SystemRoutingTable.commandExists(command))
 
     @staticmethod
     def add(sourceIP, destinationIP):

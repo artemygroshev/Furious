@@ -66,6 +66,32 @@ def resolveSplitRoutingHelper() -> str:
     return ROCKYRAY_SPLIT_ROUTING_HELPER
 
 
+def validateLinuxTunRoutingPrerequisites(interface: str, gateway: str) -> tuple[bool, str]:
+    helper = resolveSplitRoutingHelper()
+
+    if not isinstance(interface, str) or not interface:
+        return False, 'empty network interface selected for TUN routing'
+
+    if not isValidIPAddress(gateway):
+        return False, f'invalid default gateway for TUN routing: {gateway!r}'
+
+    missingCommands = SystemRoutingTable.linuxRouteToolkitMissingCommands()
+
+    if missingCommands:
+        return (
+            False,
+            f"missing Linux routing tools: {', '.join(missingCommands)}",
+        )
+
+    if not os.path.exists(helper):
+        return False, f'split-routing helper not found: {helper!r}'
+
+    if not os.access(helper, os.X_OK):
+        return False, f'split-routing helper is not executable: {helper!r}'
+
+    return True, ''
+
+
 def fixLogObjectPath(config: ConfigFactory, attr: str, value: str, log=True):
     try:
         path = config['log'][attr]
@@ -739,6 +765,12 @@ class CoreManager(Mixins.CleanupOnExit):
                 else:
                     return abortStart(f'unrecognized platform: {PLATFORM}')
 
+            if PLATFORM == 'Linux':
+                canRoute, reason = validateLinuxTunRoutingPrerequisites(interface, gateway)
+
+                if not canRoute:
+                    return abortStart(reason)
+
             tun = Tun2socks(exitCallback=exitCallback, msgCallback=msgCallbackTUN_)
             self.processesPool.append(tun)
 
@@ -806,7 +838,7 @@ class CoreManager(Mixins.CleanupOnExit):
 
                     SystemRoutingTable.Relations.clear()
 
-                    return abortStart()
+                    return abortStart('invalid user-defined TUN bypass settings')
                 else:
                     for bypass in bypassSplit:
                         if isValidIPAddress(bypass):
@@ -821,7 +853,7 @@ class CoreManager(Mixins.CleanupOnExit):
 
                             SystemRoutingTable.Relations.clear()
 
-                            return abortStart()
+                            return abortStart(f'invalid IP in TUN bypass list: {bypass}')
             else:
                 logger.info(
                     f'automatically fetching TUN settings: '
@@ -851,7 +883,7 @@ class CoreManager(Mixins.CleanupOnExit):
                     SystemRoutingTable.WIN32IpconfigFindContent,
                     APPLICATION_TUN_DEVICE_NAME,
                 ):
-                    return abortStart()
+                    return abortStart('TUN interface failed to come up on Windows')
 
                 # Handle user defined settings
                 userInterfaceName = userPrimaryAdapterInterfaceName()
@@ -1065,13 +1097,13 @@ class CoreManager(Mixins.CleanupOnExit):
                     if not SystemRoutingTable.LinuxExecutePrivilegedScript(
                         file.name, shell='bash'
                     ):
-                        return abortStart()
+                        return abortStart('failed to apply split-routing rules')
 
                     if not self.waitForTUNDeviceBroughtUp(
                         SystemRoutingTable.LinuxFindTUNDevice,
                         APPLICATION_TUN_DEVICE_NAME,
                     ):
-                        return abortStart()
+                        return abortStart('failed to bring TUN device up')
 
                 # Now bring up TUN
                 if not startTUN():

@@ -131,6 +131,21 @@ class ConnectAction(AppQAction):
 
         AppSettings.turnON_('Connect')
 
+        app = APP()
+        networkConnectivityManager = getattr(
+            app,
+            'networkConnectivityManager',
+            None,
+        )
+
+        if callable(getattr(networkConnectivityManager, 'startSingleTest', None)):
+            try:
+                networkConnectivityManager.startSingleTest()
+            except Exception as ex:
+                # Any non-exit exceptions
+
+                logger.error(f'failed to start connectivity probe: {ex}')
+
         Mixins.ConnectionAware.callConnectedCallback()
 
         # Accept new action
