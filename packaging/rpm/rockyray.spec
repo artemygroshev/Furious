@@ -1,6 +1,6 @@
 Name:           rockyray
 Version:        0.7.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        RockyRay GUI VPN client
 
 # Nuitka has already prepared the executable and its bundled shared objects.
@@ -47,6 +47,10 @@ install -Dpm 0644 rockyray.png %{buildroot}/usr/share/icons/hicolor/512x512/apps
 /usr/share/icons/hicolor/512x512/apps/rockyray.png
 
 %changelog
+* Fri Aug 28 2026 RockyRay maintainers - 0.7.0-3
+- Accept normalized Rocky Linux policy-rule output during TUN validation
+- Propagate split-routing setup failures and clean stale endpoint routes
+
 * Thu Aug 27 2026 RockyRay maintainers - 0.7.0-2
 - Route AnyDesk service traffic through the physical gateway during TUN use
 
