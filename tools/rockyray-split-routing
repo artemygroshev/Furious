@@ -41,6 +41,16 @@ log() {
     printf 'RockyRay routing: %s\n' "$*"
 }
 
+has_mark_rule() {
+    ip -4 rule show |
+        grep -Eq "^[[:space:]]*${RULE_PRIORITY}:.*from all.*fwmark ${MARK}(/0xffffffff)?[[:space:]]+lookup ${ROUTE_TABLE}([[:space:]]|$)"
+}
+
+has_source_rule() {
+    ip -4 rule show |
+        grep -Eq "^[[:space:]]*${SOURCE_RULE_PRIORITY}:.*from ${DIRECT_SOURCE_IP}(/32)?[[:space:]]+lookup ${ROUTE_TABLE}([[:space:]]|$).*proto ${SOURCE_RULE_PROTOCOL}([[:space:]]|$)"
+}
+
 restore_rp_filter() {
     [[ -e "$RP_FILTER_STATE_FILE" ]] || return 0
 
@@ -578,15 +588,13 @@ PY
         return 1
     fi
 
-    if ! ip -4 rule show |
-        grep -E "fwmark ${MARK}(/0xffffffff)? lookup ${ROUTE_TABLE}" >/dev/null; then
+    if ! has_mark_rule; then
         log "policy-правило fwmark ${MARK} не применилось"
         down_impl
         return 1
     fi
 
-    if ! ip -4 rule show |
-        grep -E "from ${DIRECT_SOURCE_IP}(/32)? lookup ${ROUTE_TABLE}" >/dev/null; then
+    if ! has_source_rule; then
         log "policy-правило для direct-outbound не применилось"
         down_impl
         return 1
@@ -619,7 +627,7 @@ status_impl() {
     echo "=== Правило policy routing ==="
     ip -4 rule show | grep -E 'fwmark 0x5252.*lookup 5252' || true
 
-    if ip -4 rule show | grep -Eq "^101:.*from ${DIRECT_SOURCE_IP}.*lookup 5252.*proto 242" &&
+    if has_source_rule &&
        ip -4 addr show dev lo | grep -Fq "$DIRECT_SOURCE_IP" &&
        [[ -e "$DIRECT_STATE_FILE" ]] &&
        nft list chain "$NFT_FAMILY" "$NFT_TABLE" postrouting 2>/dev/null |
