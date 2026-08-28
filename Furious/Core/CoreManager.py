@@ -143,7 +143,7 @@ def _linuxRoutingSanityCheck(interface: str, gateway: str) -> tuple[bool, str]:
         f'lookup {ROCKYRAY_ROUTING_TABLE}'
     )
     sourceRuleByProtocol = (
-        f'{sourceRuleByPriority}: from {ROCKYRAY_DIRECT_SOURCE_IP}/32 '
+        f'{sourceRuleByPriority} from {ROCKYRAY_DIRECT_SOURCE_IP} '
         f'lookup {ROCKYRAY_ROUTING_TABLE} proto 242'
     )
 
@@ -1101,10 +1101,14 @@ class CoreManager(Mixins.CleanupOnExit):
                         result = subprocess.run(
                             [
                                 'sudo',
-                                '-n',
+                                '-S',
+                                '-p',
+                                '',
+                                '--',
                                 resolveSplitRoutingHelper(),
                                 'down',
                             ],
+                            input=b'\n',
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE,
                             check=False,
@@ -1187,6 +1191,7 @@ class CoreManager(Mixins.CleanupOnExit):
                         filter(
                             lambda x: x != '',
                             [
+                                'set -e',
                                 commandBringUpTUN,
                                 commandSplitRouting,
                                 commandAddDefaultRoute,

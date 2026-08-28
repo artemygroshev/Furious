@@ -664,9 +664,33 @@ class SystemRoutingTable:
                 else:
                     return result.returncode, result.stdout, result.stderr
 
-        if PLATFORM == 'Linux':
-            # TODO: Do nothing under Linux
-            return
+            if PLATFORM == 'Linux':
+                try:
+                    result = runExternalCommand(
+                        [
+                            'sudo',
+                            '-S',
+                            '-p',
+                            '',
+                            '--',
+                            'ip',
+                            '-4',
+                            'route',
+                            'del',
+                            sourceIP,
+                            'via',
+                            destinationIP,
+                        ],
+                        input=b'\n',
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                except Exception:
+                    # Any non-exit exceptions
+
+                    raise
+                else:
+                    return result.returncode, result.stdout, result.stderr
 
         try:
             returncode, stdout, stderr = _delete()

@@ -579,14 +579,14 @@ PY
     fi
 
     if ! ip -4 rule show |
-        grep -F "fwmark ${MARK}/0xffffffff lookup ${ROUTE_TABLE}" >/dev/null; then
+        grep -E "fwmark ${MARK}(/0xffffffff)? lookup ${ROUTE_TABLE}" >/dev/null; then
         log "policy-правило fwmark ${MARK} не применилось"
         down_impl
         return 1
     fi
 
     if ! ip -4 rule show |
-        grep -F "from ${DIRECT_SOURCE_CIDR} lookup ${ROUTE_TABLE}" >/dev/null; then
+        grep -E "from ${DIRECT_SOURCE_IP}(/32)? lookup ${ROUTE_TABLE}" >/dev/null; then
         log "policy-правило для direct-outbound не применилось"
         down_impl
         return 1
