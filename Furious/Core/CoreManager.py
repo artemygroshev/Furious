@@ -55,6 +55,7 @@ ROCKYRAY_SPLIT_ROUTING_HELPER = '/usr/local/sbin/rockyray-split-routing'
 ROCKYRAY_ROUTING_TABLE = '5252'
 ROCKYRAY_ROUTING_RULE_PRIORITY = '100'
 ROCKYRAY_ROUTING_SOURCE_RULE_PRIORITY = '101'
+ROCKYRAY_ROUTING_SOURCE_RULE_PROTOCOL = '242'
 ROCKYRAY_ROUTING_RULE_MARK = '0x5252'
 
 
@@ -105,6 +106,58 @@ def _containsLine(text: str, needle: str) -> bool:
     return needle in text
 
 
+def _linuxRuleTokenValue(tokens: list[str], key: str) -> str:
+    try:
+        index = tokens.index(key)
+        return tokens[index + 1]
+    except (ValueError, IndexError):
+        return ''
+
+
+def _linuxRuleLines(text: str, priority: str):
+    for line in text.splitlines():
+        actualPriority, separator, body = line.strip().partition(':')
+
+        if separator and actualPriority == priority:
+            yield body.split()
+
+
+def _containsMarkRule(text: str) -> bool:
+    for tokens in _linuxRuleLines(text, ROCKYRAY_ROUTING_RULE_PRIORITY):
+        mark = _linuxRuleTokenValue(tokens, 'fwmark').split('/', 1)[0].lower()
+
+        if (
+            _linuxRuleTokenValue(tokens, 'from') == 'all'
+            and mark == ROCKYRAY_ROUTING_RULE_MARK
+            and _linuxRuleTokenValue(tokens, 'lookup') == ROCKYRAY_ROUTING_TABLE
+        ):
+            return True
+
+    return False
+
+
+def _containsSourceRule(text: str) -> bool:
+    expectedSource = ipaddress.ip_network(f'{ROCKYRAY_DIRECT_SOURCE_IP}/32')
+
+    for tokens in _linuxRuleLines(text, ROCKYRAY_ROUTING_SOURCE_RULE_PRIORITY):
+        try:
+            source = ipaddress.ip_network(
+                _linuxRuleTokenValue(tokens, 'from'), strict=False
+            )
+        except ValueError:
+            continue
+
+        if (
+            source == expectedSource
+            and _linuxRuleTokenValue(tokens, 'lookup') == ROCKYRAY_ROUTING_TABLE
+            and _linuxRuleTokenValue(tokens, 'proto')
+            == ROCKYRAY_ROUTING_SOURCE_RULE_PROTOCOL
+        ):
+            return True
+
+    return False
+
+
 def _linuxRoutingSanityCheck(interface: str, gateway: str) -> tuple[bool, str]:
     try:
         routeTable = SystemRoutingTable.LinuxGetIpRoute(ROCKYRAY_ROUTING_TABLE)
@@ -129,47 +182,10 @@ def _linuxRoutingSanityCheck(interface: str, gateway: str) -> tuple[bool, str]:
     except Exception as ex:
         return False, f'unable to inspect ip rules: {ex}'
 
-    ruleByMark = f'{ROCKYRAY_ROUTING_RULE_PRIORITY}:'
-    ruleByMarkMatcher = (
-        f'{ruleByMark} from all fwmark {ROCKYRAY_ROUTING_RULE_MARK} lookup {ROCKYRAY_ROUTING_TABLE}'
-    )
-    ruleByMarkMaskMatcher = (
-        f'{ruleByMark} from all fwmark {ROCKYRAY_ROUTING_RULE_MARK}/0xffffffff '
-        f'lookup {ROCKYRAY_ROUTING_TABLE}'
-    )
-    sourceRuleByPriority = f'{ROCKYRAY_ROUTING_SOURCE_RULE_PRIORITY}:'
-    sourceRuleByMarker = (
-        f'{sourceRuleByPriority} from {ROCKYRAY_DIRECT_SOURCE_IP}/32 '
-        f'lookup {ROCKYRAY_ROUTING_TABLE}'
-    )
-    sourceRuleByProtocol = (
-        f'{sourceRuleByPriority} from {ROCKYRAY_DIRECT_SOURCE_IP} '
-        f'lookup {ROCKYRAY_ROUTING_TABLE} proto 242'
-    )
-
-    if not (
-        _containsLine(rules, ruleByMarkMatcher)
-        or _containsLine(rules, ruleByMarkMaskMatcher)
-        or (
-            _containsLine(rules, ruleByMark)
-            and _containsLine(rules, ROCKYRAY_ROUTING_RULE_MARK)
-            and _containsLine(rules, ROCKYRAY_ROUTING_TABLE)
-        )
-    ):
+    if not _containsMarkRule(rules):
         return False, 'policy routing check failed: missing fwmark route rule'
 
-    if not _containsLine(rules, ruleByMark):
-        return False, f'policy routing check failed: missing priority {ROCKYRAY_ROUTING_RULE_PRIORITY}'
-
-    if not (
-        _containsLine(rules, sourceRuleByMarker)
-        or _containsLine(rules, sourceRuleByProtocol)
-        or (
-            _containsLine(rules, sourceRuleByPriority)
-            and _containsLine(rules, ROCKYRAY_DIRECT_SOURCE_IP)
-            and _containsLine(rules, ROCKYRAY_ROUTING_TABLE)
-        )
-    ):
+    if not _containsSourceRule(rules):
         return False, 'policy routing check failed: missing direct-outbound source rule marker'
 
     try:
