@@ -501,7 +501,10 @@ class Application(ApplicationFactory, SingletonApplication):
                 self.themeListenerThread.start()
 
             # Mandatory
-            self.setQuitOnLastWindowClosed(True)
+            # Closing the main window must only hide the UI. RockyRay is a
+            # tray application, and exiting here also tears down the active
+            # TUN interface and briefly removes all VPN routing.
+            self.setQuitOnLastWindowClosed(False)
 
             self.aboutToQuit.connect(Application.cleanup)
 

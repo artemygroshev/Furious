@@ -50,10 +50,19 @@ class Storage:
 
     @staticmethod
     @functools.lru_cache(None)
-    def UserSubs() -> dict[str, dict]:
+    def _UserSubsStorage() -> UserSubs:
         assert APP() is not None
 
-        return UserSubs().data()
+        return UserSubs()
+
+    @staticmethod
+    @functools.lru_cache(None)
+    def UserSubs() -> dict[str, dict]:
+        return Storage._UserSubsStorage().data()
+
+    @staticmethod
+    def SyncUserSubs():
+        Storage._UserSubsStorage().sync()
 
     @staticmethod
     @functools.lru_cache(None)

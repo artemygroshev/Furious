@@ -1,6 +1,6 @@
 Name:           rockyray
 Version:        0.7.0
-Release:        4%{?dist}
+Release:        5%{?dist}
 Summary:        RockyRay GUI VPN client
 
 # Nuitka has already prepared the executable and its bundled shared objects.
@@ -47,6 +47,11 @@ install -Dpm 0644 rockyray.png %{buildroot}/usr/share/icons/hicolor/512x512/apps
 /usr/share/icons/hicolor/512x512/apps/rockyray.png
 
 %changelog
+* Mon Aug 31 2026 RockyRay maintainers - 0.7.0-5
+- Keep VPN running when the main window is closed
+- Defer subscription replacement while VPN is connected
+- Fix immediate subscription persistence crash
+
 * Fri Aug 28 2026 RockyRay maintainers - 0.7.0-4
 - Validate exact policy-rule priorities and fields without substring matches
 

@@ -367,7 +367,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
                     )
 
                     Storage.UserSubs().pop(deleteUnique)
-                    Storage.UserSubs().sync()
+                    Storage.SyncUserSubs()
 
                     # Begin timer cleanup
                     qtimer = self.timers[deleteIndex]
@@ -491,6 +491,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
 
         # Write to subs object
         subsob['autoupdate'] = textEnglish
+        Storage.SyncUserSubs()
         self.sourceModel.emitRowChanged(row, self.Headers.index('Auto Update'))
 
         # Return potentially fixed value
@@ -519,6 +520,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
 
         # Write to subs object
         subsob['proxy'] = textEnglish
+        Storage.SyncUserSubs()
         self.sourceModel.emitRowChanged(
             row, self.Headers.index('Auto Update Use Proxy')
         )
@@ -614,7 +616,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
         if unique in Storage.UserSubs():
             row = list(Storage.UserSubs().keys()).index(unique)
             Storage.UserSubs().update(subsob)
-            Storage.UserSubs().sync()
+            Storage.SyncUserSubs()
             self.flushRow(row, subsob[unique])
         else:
             row = self.sourceModel.rowCount()
@@ -625,7 +627,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
 
             self.sourceModel.beginInsertRows(QtCore.QModelIndex(), row, row)
             Storage.UserSubs().update(subsob)
-            Storage.UserSubs().sync()
+            Storage.SyncUserSubs()
             self.sourceModel.endInsertRows()
 
             self.flushRow(row, subsob[unique])
@@ -635,6 +637,22 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
         unique: str, httpProxy: Union[str, Callable, None], **kwargs
     ):
         showMessageBox = kwargs.pop('showMessageBox', False)
+
+        app = APP()
+
+        if app is None:
+            return
+
+        # Updating a subscription replaces its server rows. If the active
+        # row belongs to that subscription, the original implementation
+        # intentionally disconnects and rebuilds TUN. Never let a timer or
+        # background update interrupt a live VPN session.
+        if app.isSystemTrayConnected():
+            logger.info(
+                f'deferred subscription update {unique!r}: VPN is connected'
+            )
+
+            return
 
         if callable(httpProxy):
             try:
@@ -651,7 +669,7 @@ class UserSubsQTableView(Mixins.QTranslatable, AppQTableView):
         else:
             realHttpProxy = httpProxy
 
-        APP().mainWindow.updateSubsByUnique(
+        app.mainWindow.updateSubsByUnique(
             unique, realHttpProxy, showMessageBox=showMessageBox, **kwargs
         )
 
