@@ -174,13 +174,26 @@ class SubscriptionManager(WebGETManager):
         failureArgs = kwargs.pop('failureArgs', list())
         showMessageBox = kwargs.pop('showMessageBox', True)
 
+        app = APP()
+
+        # The connection may have been established while a previously
+        # started HTTP request was still in flight. Re-check at commit time
+        # so a late subscription response cannot delete the active server
+        # and tear down TUN behind the user's back.
+        if successArgs and app is not None and app.isSystemTrayConnected():
+            reason = 'VPN is connected; subscription replacement was deferred'
+            logger.info(reason)
+
+            failureArgs.extend({'error': reason, **param} for param in successArgs)
+            successArgs.clear()
+
         for param in successArgs:
             uris, unique = param['uris'], param['unique']
 
             parent = self.parent()
 
             if isinstance(parent, UserServersQTableView):
-                isConnected = APP().isSystemTrayConnected()
+                isConnected = app.isSystemTrayConnected()
 
                 subsIndexes = list(
                     index
